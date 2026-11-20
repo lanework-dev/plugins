@@ -23,8 +23,13 @@ is the hook in [fuongz/lanework](https://github.com/fuongz/lanework)
 `plugins/lanework/build.json` names the commit it was built from and the bun
 that built it.
 
-To update it, from a clone of fuongz/lanework with the change committed and
-this repository cloned next to it as `../lanework-dev/plugins`:
+Every push to fuongz/lanework's main rebuilds it (`plugin-sync` workflow
+there); when the bundle changed, it opens or refreshes the `sync/hook` pull
+request here with the bundle, `build.json` and a patch bump of the plugin's
+version. Review and merge it once `check` passes.
+
+To do the same by hand, from a clone of fuongz/lanework with the change
+committed and this repository cloned next to it as `../lanework-dev/plugins`:
 
 ```sh
 bun run build:plugin            # or: node scripts/build-plugin.mjs --out <this clone>
