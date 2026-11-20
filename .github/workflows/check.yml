@@ -1,0 +1,58 @@
+# The committed hook bundle must be exactly what its source builds to.
+# plugins/lanework/build.json names the fuongz/lanework commit and the bun;
+# this job checks that commit out, rebuilds and compares byte for byte.
+name: check
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bundle:
+    name: bundle
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          path: plugins
+          persist-credentials: false
+      - name: Read build.json
+        id: stamp
+        run: |
+          stamp=plugins/plugins/lanework/build.json
+          echo "commit=$(jq -er .commit "$stamp")" >> "$GITHUB_OUTPUT"
+          echo "bun=$(jq -er .bun "$stamp")" >> "$GITHUB_OUTPUT"
+          if [ "$(jq -r '.dirty // false' "$stamp")" = "true" ]; then
+            echo "::error file=$stamp::built from a dirty tree; rebuild from a clean commit"
+            exit 1
+          fi
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          repository: fuongz/lanework
+          ref: ${{ steps.stamp.outputs.commit }}
+          path: source
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: ${{ steps.stamp.outputs.bun }}
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: 24
+      # The bundle needs only the hook's imports (@lanework/contracts); no
+      # install scripts, so no Electron download.
+      - run: bun install --frozen-lockfile --ignore-scripts
+        working-directory: source
+      - run: node scripts/build-plugin.mjs --out "$GITHUB_WORKSPACE/plugins" --check
+        working-directory: source
+      - name: Manifests parse
+        working-directory: plugins
+        run: |
+          for f in .claude-plugin/marketplace.json plugins/*/.claude-plugin/plugin.json plugins/*/.mcp.json plugins/*/hooks/hooks.json; do
+            jq empty "$f"
+          done
