@@ -50,13 +50,13 @@ __export(exports_lanework_checkpoint, {
   snapshot: () => snapshot
 });
 module.exports = __toCommonJS(exports_lanework_checkpoint);
-var import_node_child_process4 = require("node:child_process");
-var import_node_crypto5 = require("node:crypto");
+var import_node_child_process5 = require("node:child_process");
+var import_node_crypto6 = require("node:crypto");
 var import_node_fs6 = require("node:fs");
-var import_node_os6 = require("node:os");
+var import_node_os7 = require("node:os");
 var import_node_path9 = require("node:path");
 
-// node_modules/.bun/@lanework+contracts@0.5.3/node_modules/@lanework/contracts/dist/index.js
+// node_modules/.bun/@lanework+contracts@0.5.7/node_modules/@lanework/contracts/dist/index.js
 var LOOPBACK_CALLBACK_PATH = "/oauth/callback";
 var PROJECT_AVATAR_COLORS = [
   "slate",
@@ -301,9 +301,19 @@ var CONTROL_TOOL_LIMITS = {
   MEMORY_NOTES_MAX: 8000,
   LEAD_NAME_MAX: 60,
   LEAD_INSTRUCTIONS_MAX: 20000,
-  LEAD_CONTEXT_FILES_MAX: 20
+  LEAD_CONTEXT_FILES_MAX: 20,
+  THREAD_READ_LIMIT_MAX: 20,
+  THREAD_READ_TURN_CHARS: 4000,
+  SUMMARY_MAX: 120,
+  MESSAGES_PER_HOUR: 20,
+  LOOP_MINUTES_MIN: 5,
+  LOOP_MINUTES_MAX: 1440
 };
 var L = CONTROL_TOOL_LIMITS;
+var SUMMARY = {
+  type: "string",
+  description: `A few words on what is asked, at most ${L.SUMMARY_MAX} characters: the user reads it first, the text folded under it`
+};
 var WORKER_TEXT = {
   type: "string",
   description: `Instructions for the worker, at most ${L.PROMPT_MAX} characters`
@@ -1053,7 +1063,118 @@ function toolInputSchema(shape) {
 }
 
 // apps/desktop/electron/main/git/runner.ts
+var import_node_child_process2 = require("node:child_process");
+
+// apps/desktop/electron/main/harness/shell.ts
 var import_node_child_process = require("node:child_process");
+var import_node_os = require("node:os");
+
+// apps/desktop/electron/main/terminal/shell-env.ts
+function defaultShell(env = process.env) {
+  if (process.platform === "win32")
+    return { file: env.COMSPEC || "powershell.exe", args: [] };
+  const file = env.LANEWORK_TERMINAL_SHELL || env.SHELL || (process.platform === "darwin" ? "/bin/zsh" : "/bin/bash");
+  return { file, args: ["-l"] };
+}
+function shellEnv(env) {
+  const out = {};
+  for (const [key, value] of Object.entries(env)) {
+    if (value === undefined)
+      continue;
+    if (key.startsWith("LANEWORK_") || key.startsWith("ELECTRON_"))
+      continue;
+    out[key] = value;
+  }
+  out.TERM = "xterm-256color";
+  out.COLORTERM = "truecolor";
+  out.TERM_PROGRAM = "Lanework";
+  if (!out.LANG && process.platform === "darwin")
+    out.LANG = "en_US.UTF-8";
+  return out;
+}
+
+// apps/desktop/electron/main/harness/shell.ts
+var MAX_BYTES = 256 * 1024;
+function runInLoginShell(script, options) {
+  const env = options.env ?? process.env;
+  const shell = options.shell ?? defaultShell(env);
+  return new Promise((resolve) => {
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    const keep = (text) => text.length > MAX_BYTES ? text.slice(-MAX_BYTES) : text;
+    const child = import_node_child_process.spawn(shell.file, [...shell.args, "-i", "-c", script], {
+      cwd: import_node_os.homedir(),
+      env: shellEnv(env),
+      stdio: ["ignore", "pipe", "pipe"],
+      detached: true
+    });
+    const kill = () => {
+      try {
+        if (child.pid)
+          process.kill(-child.pid, "SIGKILL");
+      } catch {}
+    };
+    const settle = (code) => {
+      if (settled)
+        return;
+      settled = true;
+      clearTimeout(timer);
+      options.signal?.removeEventListener("abort", abort);
+      resolve({ stdout, stderr, code });
+    };
+    const timer = setTimeout(() => {
+      kill();
+      settle(null);
+    }, options.timeoutMs);
+    const abort = () => {
+      kill();
+      settle(null);
+    };
+    if (options.signal?.aborted)
+      abort();
+    else
+      options.signal?.addEventListener("abort", abort, { once: true });
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      stdout = keep(stdout + chunk);
+      options.onStdout?.(chunk);
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr = keep(stderr + chunk);
+    });
+    child.once("error", () => settle(null));
+    child.once("close", (code) => settle(code));
+  });
+}
+function afterMarker(output, marker) {
+  const at = output.lastIndexOf(marker);
+  return at < 0 ? null : output.slice(at + marker.length);
+}
+
+// apps/desktop/electron/main/git/login-path.ts
+var MARK = "__lanework_git_path__";
+var found = null;
+function loginPath() {
+  if (process.platform === "win32")
+    return Promise.resolve(null);
+  found ??= runInLoginShell(`printf '\\n%s\\n' '${MARK}'; printf '%s\\n' "$PATH"`, { timeoutMs: 1e4 }).then(({ stdout }) => {
+    const line = afterMarker(stdout, MARK)?.trim().split(`
+`)[0]?.trim();
+    return line || null;
+  }).catch(() => null);
+  return found;
+}
+async function withLoginPath(env) {
+  const shell = await loginPath();
+  if (!shell)
+    return env;
+  const dirs = [...shell.split(":"), ...(env.PATH ?? "").split(":")];
+  return { ...env, PATH: [...new Set(dirs.filter(Boolean))].join(":") };
+}
+
+// apps/desktop/electron/main/git/runner.ts
 var MAX_OUTPUT = 32 * 1024 * 1024;
 var DEFAULT_TIMEOUT = 15000;
 var BASE_FLAGS = [
@@ -1076,16 +1197,17 @@ var READ_FLAGS = [
 ];
 class GitMissingError extends Error {
 }
-function exec(flags, cwd, args, options) {
+async function exec(flags, cwd, args, options) {
   const ok = options.ok ?? [0];
+  const env = await withLoginPath(options.env ?? process.env);
   return new Promise((resolve, reject) => {
-    import_node_child_process.execFile("git", [...flags, ...args], {
+    import_node_child_process2.execFile("git", [...flags, ...args], {
       cwd,
       timeout: options.timeout ?? DEFAULT_TIMEOUT,
       maxBuffer: options.maxBuffer ?? MAX_OUTPUT,
       windowsHide: true,
       encoding: options.encoding ?? "utf8",
-      env: options.env ?? process.env
+      env
     }, (error, stdout, stderr) => {
       if (!error)
         return resolve({ stdout, code: 0 });
@@ -1114,7 +1236,7 @@ var import_promises2 = require("node:fs/promises");
 var import_node_path3 = require("node:path");
 
 // apps/desktop/electron/main/paths.ts
-var import_node_os = require("node:os");
+var import_node_os2 = require("node:os");
 var import_node_path = require("node:path");
 
 // apps/desktop/shared/conversation.ts
@@ -1193,6 +1315,10 @@ var WEB_FETCH_TOOLS = new Set([
   "fetch"
 ]);
 
+// apps/desktop/shared/project-avatar.ts
+var PROJECT_AVATAR_SOLIDS = PROJECT_AVATAR_COLORS.slice(0, 10);
+var PROJECT_AVATAR_GRADIENTS = PROJECT_AVATAR_COLORS.slice(10);
+
 // apps/desktop/shared/orchestration.ts
 var CONTROL_INPUT_MAX = 256 * 1024;
 var LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
@@ -1201,10 +1327,11 @@ var LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
 var APP_HOME_NAME = ".lanew";
 var homeName = APP_HOME_NAME;
 function appHomeDir() {
-  return process.env.LANEWORK_HOME || import_node_path.join(import_node_os.homedir(), homeName);
+  return process.env.LANEWORK_HOME || import_node_path.join(import_node_os2.homedir(), homeName);
 }
 
 // apps/desktop/electron/main/git/repo-trust.ts
+var import_node_crypto = require("node:crypto");
 var import_promises = require("node:fs/promises");
 var import_node_path2 = require("node:path");
 var OFF = new Set(["false", "no", "off", "0", ""]);
@@ -1294,29 +1421,71 @@ class TrustStore {
   answers = new Map;
   constructor(initial = {}, onChange) {
     this.onChange = onChange;
-    for (const [folder, value] of Object.entries(initial))
-      this.answers.set(import_node_path2.resolve(folder), value);
+    for (const [key, value] of Object.entries(initial))
+      this.answers.set(key.startsWith(REPO_PREFIX) ? key : import_node_path2.resolve(key), value);
   }
-  get(folder) {
-    return this.answers.get(import_node_path2.resolve(folder));
+  repoKey(scan) {
+    if (!scan.gitDir)
+      return null;
+    const hash = import_node_crypto.createHash("sha1").update(trustFingerprint(scan.findings)).digest("hex").slice(0, 16);
+    return `${REPO_PREFIX}${import_node_path2.resolve(scan.gitDir)}#${hash}`;
+  }
+  legacyKeys(folder, scan) {
+    const keys = [import_node_path2.resolve(folder)];
+    if (scan.gitDir && import_node_path2.basename(scan.gitDir) === ".git")
+      keys.push(import_node_path2.resolve(import_node_path2.dirname(scan.gitDir)));
+    return [...new Set(keys)];
+  }
+  lookup(folder, scan) {
+    const key = this.repoKey(scan);
+    const fingerprint = trustFingerprint(scan.findings);
+    if (key) {
+      const known = this.answers.get(key);
+      if (known)
+        return known;
+    }
+    for (const legacy of this.legacyKeys(folder, scan)) {
+      const known = this.answers.get(legacy);
+      if (known && known.fingerprint === fingerprint) {
+        if (key) {
+          this.answers.set(key, known);
+          this.onChange?.(this.toJSON());
+        }
+        return known;
+      }
+    }
+    return;
   }
   set(folder, answer, scan) {
-    this.answers.set(import_node_path2.resolve(folder), {
+    const key = this.repoKey(scan) ?? import_node_path2.resolve(folder);
+    this.answers.set(key, {
       answer,
       fingerprint: trustFingerprint(scan.findings)
     });
     this.onChange?.(this.toJSON());
   }
-  forget(folder) {
-    if (this.answers.delete(import_node_path2.resolve(folder)))
+  forget(folder, scan) {
+    let changed = false;
+    const drop = (key) => {
+      if (key && this.answers.delete(key))
+        changed = true;
+    };
+    if (!scan)
+      drop(import_node_path2.resolve(folder));
+    else {
+      drop(this.repoKey(scan));
+      for (const legacy of this.legacyKeys(folder, scan))
+        drop(legacy);
+    }
+    if (changed)
       this.onChange?.(this.toJSON());
   }
   async decide(folder) {
     const scan = await scanRepoTrust(folder);
     if (!scan.risky)
       return { kind: "run" };
-    const known = this.get(folder);
-    if (known && known.fingerprint === trustFingerprint(scan.findings))
+    const known = this.lookup(folder, scan);
+    if (known)
       return known.answer === "trusted" ? { kind: "run" } : { kind: "restricted" };
     return { kind: "ask", scan };
   }
@@ -1324,6 +1493,7 @@ class TrustStore {
     return Object.fromEntries(this.answers);
   }
 }
+var REPO_PREFIX = "repo:";
 
 // apps/desktop/electron/main/git/trust-gate.ts
 var FRESH_MS = 60000;
@@ -1383,13 +1553,13 @@ async function decide(folder) {
 }
 
 // apps/desktop/electron/hook/cli.ts
-var import_node_child_process3 = require("node:child_process");
+var import_node_child_process4 = require("node:child_process");
 var import_node_fs3 = require("node:fs");
-var import_node_os5 = require("node:os");
+var import_node_os6 = require("node:os");
 var import_node_path7 = require("node:path");
 
 // apps/desktop/electron/main/auth/client.ts
-var import_node_os2 = require("node:os");
+var import_node_os3 = require("node:os");
 
 // apps/desktop/electron/main/http-body.ts
 var JSON_BODY_CAP = 8 * 1024 * 1024;
@@ -1476,7 +1646,7 @@ function looksLikeUserCode(value) {
 var LOOPBACK_HOSTS2 = new Set(["127.0.0.1", "[::1]", "localhost"]);
 var refusedApis = new Set;
 function machineFacts(name) {
-  const host = import_node_os2.hostname();
+  const host = import_node_os3.hostname();
   return {
     name: (name || host || "desktop").slice(0, 120),
     hostname: host,
@@ -1695,18 +1865,18 @@ async function listenForCallback(input) {
 }
 
 // apps/desktop/electron/main/auth/pkce.ts
-var import_node_crypto = require("node:crypto");
+var import_node_crypto2 = require("node:crypto");
 function pkcePair() {
-  const verifier = import_node_crypto.randomBytes(32).toString("base64url");
-  const challenge = import_node_crypto.createHash("sha256").update(verifier).digest().toString("base64url");
+  const verifier = import_node_crypto2.randomBytes(32).toString("base64url");
+  const challenge = import_node_crypto2.createHash("sha256").update(verifier).digest().toString("base64url");
   return { verifier, challenge };
 }
 function newState() {
-  return import_node_crypto.randomBytes(16).toString("base64url");
+  return import_node_crypto2.randomBytes(16).toString("base64url");
 }
 
 // apps/desktop/electron/mcp-local/server.ts
-var import_node_os3 = require("node:os");
+var import_node_os4 = require("node:os");
 
 // apps/desktop/electron/local-store/driver.ts
 var import_node_module = require("node:module");
@@ -1752,9 +1922,9 @@ function openDatabase(path) {
   };
 }
 // apps/desktop/electron/local-store/ids.ts
-var import_node_crypto2 = require("node:crypto");
+var import_node_crypto3 = require("node:crypto");
 function uuidv7(now = Date.now()) {
-  const bytes = import_node_crypto2.randomBytes(16);
+  const bytes = import_node_crypto3.randomBytes(16);
   let ms = BigInt(now);
   for (let index = 5;index >= 0; index -= 1) {
     bytes[index] = Number(ms & 0xffn);
@@ -1929,10 +2099,6 @@ function migrate(db) {
 // apps/desktop/electron/local-store/store.ts
 var import_node_fs = require("node:fs");
 var import_node_path5 = require("node:path");
-
-// apps/desktop/shared/project-avatar.ts
-var PROJECT_AVATAR_SOLIDS = PROJECT_AVATAR_COLORS.slice(0, 10);
-var PROJECT_AVATAR_GRADIENTS = PROJECT_AVATAR_COLORS.slice(10);
 
 // apps/desktop/electron/main/projects/review-defaults.ts
 var DEFAULT_COLUMNS = [
@@ -3472,7 +3638,7 @@ function text(value, isError = false) {
 class LocalMcpSession {
   store;
   #agent = "agent";
-  #host = import_node_os3.hostname();
+  #host = import_node_os4.hostname();
   constructor(store) {
     this.store = store;
   }
@@ -3661,15 +3827,15 @@ function runLocalMcpServer(options = {}) {
   });
 }
 // apps/desktop/electron/hook/credential.ts
-var import_node_child_process2 = require("node:child_process");
-var import_node_crypto3 = require("node:crypto");
+var import_node_child_process3 = require("node:child_process");
+var import_node_crypto4 = require("node:crypto");
 var import_node_fs2 = require("node:fs");
-var import_node_os4 = require("node:os");
+var import_node_os5 = require("node:os");
 var import_node_path6 = require("node:path");
 var KEYCHAIN_SERVICE = "dev.lanework.checkpoint-hook";
 var SECURITY = "/usr/bin/security";
 function configDir() {
-  return import_node_path6.join(process.env.XDG_CONFIG_HOME || import_node_path6.join(import_node_os4.homedir(), ".config"), "lanework");
+  return import_node_path6.join(process.env.XDG_CONFIG_HOME || import_node_path6.join(import_node_os5.homedir(), ".config"), "lanework");
 }
 function originOf(api) {
   try {
@@ -3686,7 +3852,7 @@ function secretFile(api) {
   const origin = originOf(api);
   if (origin === DEFAULT_API_ORIGIN)
     return import_node_path6.join(configDir(), "credential");
-  const key = import_node_crypto3.createHash("sha256").update(origin).digest("hex").slice(0, 16);
+  const key = import_node_crypto4.createHash("sha256").update(origin).digest("hex").slice(0, 16);
   return import_node_path6.join(configDir(), `credential-${key}`);
 }
 function credentialLocation(api) {
@@ -3714,7 +3880,7 @@ function readSecret(api) {
     }
   }
   try {
-    return import_node_child_process2.execFileSync(SECURITY, ["find-generic-password", "-s", KEYCHAIN_SERVICE, "-a", api, "-w"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim() || null;
+    return import_node_child_process3.execFileSync(SECURITY, ["find-generic-password", "-s", KEYCHAIN_SERVICE, "-a", api, "-w"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim() || null;
   } catch {
     return null;
   }
@@ -3730,7 +3896,7 @@ function writeSecret(api, secret) {
     return;
   }
   assertSafe("API address", api);
-  import_node_child_process2.execFileSync(SECURITY, ["-i"], {
+  import_node_child_process3.execFileSync(SECURITY, ["-i"], {
     input: `add-generic-password -U -s "${KEYCHAIN_SERVICE}" -a "${api}" -w "${secret}"
 `,
     stdio: ["pipe", "ignore", "inherit"]
@@ -3743,7 +3909,7 @@ function deleteSecret(api) {
     return;
   }
   try {
-    import_node_child_process2.execFileSync(SECURITY, ["delete-generic-password", "-s", KEYCHAIN_SERVICE, "-a", api], { stdio: "ignore" });
+    import_node_child_process3.execFileSync(SECURITY, ["delete-generic-password", "-s", KEYCHAIN_SERVICE, "-a", api], { stdio: "ignore" });
   } catch {}
 }
 
@@ -3761,7 +3927,7 @@ function openBrowser(url) {
   if (!opener)
     return false;
   try {
-    import_node_child_process3.spawn(opener, [url], { stdio: "ignore", detached: true }).unref();
+    import_node_child_process4.spawn(opener, [url], { stdio: "ignore", detached: true }).unref();
     return true;
   } catch {
     return false;
@@ -3814,7 +3980,7 @@ async function startDeviceLogin(api, stateDir) {
     deadline: Date.now() + DEVICE_TTL_MS
   };
   import_node_fs3.writeFileSync(file, JSON.stringify(pending), { mode: 384 });
-  import_node_child_process3.spawn(process.execPath, [process.argv[1] ?? "", "--plugin", "login-wait", file], { detached: true, stdio: "ignore" }).unref();
+  import_node_child_process4.spawn(process.execPath, [process.argv[1] ?? "", "--plugin", "login-wait", file], { detached: true, stdio: "ignore" }).unref();
   console.log([
     `On any device, open ${started.verificationUri} and enter the code:`,
     "",
@@ -3953,7 +4119,7 @@ function config(key, value) {
 Nothing is pushed until \`lanework config push-wip on\`.` : said);
 }
 function desktopHookInstalled() {
-  const settings = import_node_path7.join(process.env.CLAUDE_CONFIG_DIR || import_node_path7.join(import_node_os5.homedir(), ".claude"), "settings.json");
+  const settings = import_node_path7.join(process.env.CLAUDE_CONFIG_DIR || import_node_path7.join(import_node_os6.homedir(), ".claude"), "settings.json");
   if (!import_node_fs3.existsSync(settings))
     return false;
   try {
@@ -3967,7 +4133,7 @@ function mcp() {
 }
 
 // apps/desktop/electron/hook/compaction.ts
-var import_node_crypto4 = require("node:crypto");
+var import_node_crypto5 = require("node:crypto");
 var import_node_fs4 = require("node:fs");
 var import_node_path8 = require("node:path");
 var COMPACT_WINDOW_MS = 15 * 60 * 1000;
@@ -3987,7 +4153,7 @@ function sessionStartOutput(context) {
   });
 }
 function markerFile(stateDir, sessionId) {
-  const id = import_node_crypto4.createHash("sha256").update(sessionId).digest("hex");
+  const id = import_node_crypto5.createHash("sha256").update(sessionId).digest("hex");
   return import_node_path8.join(stateDir, `compact-${id}.json`);
 }
 function writeMarker(file, marker) {
@@ -4164,7 +4330,7 @@ var PUSH_WIP = ARGS.flags.has("push-wip") || HOOK_CONFIG.pushWip === true;
 var PUSH_WIP_UNTRACKED = ARGS.flags.has("push-wip-untracked") || HOOK_CONFIG.pushWipUntracked === true;
 var AGENT = ARGS.flags.get("agent") === "codex" ? "codex" : ARGS.flags.get("agent") === "opencode" ? "opencode" : "claude-code";
 var AGENT_NAME = AGENT === "codex" ? "Codex" : AGENT === "opencode" ? "OpenCode" : "Claude Code";
-var STATE_DIR = import_node_path9.join(import_node_os6.homedir(), ".cache", "lanework", "checkpoint");
+var STATE_DIR = import_node_path9.join(import_node_os7.homedir(), ".cache", "lanework", "checkpoint");
 var LOG = import_node_path9.join(STATE_DIR, "hook.log");
 var THIN_MS = 60000;
 var PUSH_TIMEOUT_MS = 30000;
@@ -4187,7 +4353,7 @@ function log(message) {
 }
 function git(cwd, args, env) {
   const safe = args[0] === "diff" ? ["diff", "--no-ext-diff", "--no-textconv", ...args.slice(1)] : args;
-  return import_node_child_process4.execFileSync("git", [...READ_FLAGS, ...safe], {
+  return import_node_child_process5.execFileSync("git", [...READ_FLAGS, ...safe], {
     cwd,
     env: { ...process.env, ...env },
     encoding: "utf8",
@@ -4202,7 +4368,7 @@ function tryGit(cwd, args) {
     return null;
   }
 }
-var sha256 = (s) => import_node_crypto5.createHash("sha256").update(s).digest("hex");
+var sha256 = (s) => import_node_crypto6.createHash("sha256").update(s).digest("hex");
 function clip2(s, max) {
   return s.length > max ? `${s.slice(0, max - 1)}…` : s;
 }
@@ -4357,7 +4523,7 @@ function unquote(literal) {
 function findCodexRollout(sessionId) {
   if (!sessionId)
     return null;
-  const base = import_node_path9.join(process.env.CODEX_HOME || import_node_path9.join(import_node_os6.homedir(), ".codex"), "sessions");
+  const base = import_node_path9.join(process.env.CODEX_HOME || import_node_path9.join(import_node_os7.homedir(), ".codex"), "sessions");
   const ls = (dir) => {
     try {
       return import_node_fs6.readdirSync(dir).sort().reverse();
@@ -4506,7 +4672,7 @@ function opencodeDataDir() {
     return process.env.OPENCODE_DATA_DIR;
   if (process.env.XDG_DATA_HOME)
     return import_node_path9.join(process.env.XDG_DATA_HOME, "opencode");
-  return import_node_path9.join(import_node_os6.homedir(), ".local", "share", "opencode");
+  return import_node_path9.join(import_node_os7.homedir(), ".local", "share", "opencode");
 }
 var asObject = (value) => value && typeof value === "object" && !Array.isArray(value) ? value : {};
 function parseData(raw) {
@@ -4779,7 +4945,7 @@ function refusal(root, env) {
   const file = changed.find(isSecretFile);
   if (file)
     return `${file} looks like a secrets file`;
-  const patch = import_node_child_process4.execFileSync("git", [
+  const patch = import_node_child_process5.execFileSync("git", [
     "diff",
     "--cached",
     "-U0",
@@ -4966,7 +5132,7 @@ async function checkpointTo(local, d, input, root, remote, options = {}) {
   const pushed = last?.pushedCode === code ? last.wip : null;
   const wip = PUSH_WIP ? pushed ?? snapshot(root, d.taskId) : { wipRef: null, wipSha: null };
   const body = buildBody(d, {
-    host: import_node_os6.hostname(),
+    host: import_node_os7.hostname(),
     session: input.session_id ?? null,
     git: {
       branch: tryGit(root, ["rev-parse", "--abbrev-ref", "HEAD"]),
@@ -5046,10 +5212,10 @@ async function setup(token) {
     method: "POST",
     body: JSON.stringify({
       token,
-      name: `${import_node_os6.hostname()} (checkpoint hook)`,
-      hostname: import_node_os6.hostname(),
-      os: import_node_os6.platform(),
-      arch: import_node_os6.arch()
+      name: `${import_node_os7.hostname()} (checkpoint hook)`,
+      hostname: import_node_os7.hostname(),
+      os: import_node_os7.platform(),
+      arch: import_node_os7.arch()
     })
   });
   if (!res.ok) {
@@ -5131,7 +5297,7 @@ async function main() {
     const file = import_node_path9.join(STATE_DIR, `input-${process.pid}-${Date.now()}.json`);
     import_node_fs6.writeFileSync(file, stdin, { mode: 384 });
     const flags = process.argv.slice(2).filter((a) => !ARGS.positional.includes(a));
-    import_node_child_process4.spawn(process.execPath, [SELF, ...flags, "worker", file], {
+    import_node_child_process5.spawn(process.execPath, [SELF, ...flags, "worker", file], {
       detached: true,
       stdio: "ignore"
     }).unref();
